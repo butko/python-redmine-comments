@@ -1,14 +1,24 @@
 #!/usr/bin/env python3
-# Версия: v1.10
+# Версия: v2.2
 """
-Добавляет комментарий к задаче Redmine через браузер.
-Режимы: auto (по умолчанию), attach, launch.
-В auto проверяется, отвечает ли порт как Chrome DevTools; если нет —
-запускается выделенный экземпляр браузера с профилем скрипта.
+Добавляет комментарии к нескольким задачам Redmine через браузер.
+Задачи задаются секциями [task:<метка>]. Для каждой задачи текст
+собирается из comment_files или comment_text.
 
-Текст комментария берётся из файла comment_file (если задан) или из
-comment_text. Драйвер ищется в папке скрипта: сначала chromedriver,
-затем yandexdriver.
+Перед задачей могут запускаться парсеры (секции [prepare:<имя>]).
+Список парсеров для задачи — параметр prepare. Если в [redmine] задан
+prepare_all = true, все парсеры, на которые ссылаются задачи, запускаются
+до цикла. Один и тот же парсер в рамках одного прогона не запускается
+дважды (кэш).
+
+Режимы работы:
+  (без флагов)         — обычный прогон по задачам;
+  --login              — одноразовый вход в Redmine;
+  --prepare <имя>      — запустить один парсер и выйти, без отправки комментариев;
+  --prepare-all        — запустить все парсеры из [prepare:*] и выйти.
+
+По умолчанию конфиг ищется в файле config.ini рядом со скриптом.
+Путь можно переопределить аргументом --config.
 """
 
 import argparse
@@ -21,6 +31,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from selenium import webdriver
@@ -36,8 +47,10 @@ DEFAULT_BROWSER_BINARY = "/usr/bin/chromium"
 DEFAULT_DEBUGGER_PORT = 9222
 DEFAULT_TIMEOUT = 15
 DEFAULT_WAIT_AFTER_SUBMIT = 3
+DEFAULT_TASK_PAUSE = 2
 DEFAULT_HEADLESS = False
 DEFAULT_CLOSE_AFTER = False
+DEFAULT_PARSER_TIMEOUT = 600
 
 DEFAULT_NOTES_FIELD_ID = "issue_notes"
 DEFAULT_SUBMIT_BUTTON_NAME = "commit"
@@ -46,10 +59,31 @@ DRIVER_NAMES = ("chromedriver", "yandexdriver")
 SCRIPT_DIR = Path(__file__).resolve().parent
 LOGIN_LOG_NAME = "chromium_login.log"
 SCRIPT_LOG_NAME = "redmine_commenter.log"
+TASK_SECTION_PREFIX = "task:"
+PREPARE_SECTION_PREFIX = "prepare:"
+
+
+@dataclass
+class Task:
+    """Одна задача: метка, URL, готовый текст, источник и список парсеров."""
+    label: str
+    issue_url: str
+    comment_text: str
+    source: str
+    prepare: list = field(default_factory=list)
+
+
+@dataclass
+class PrepareSpec:
+    """Описание парсера: имя, путь к скрипту, доп. аргументы, таймаут."""
+    name: str
+    script: Path
+    args: list
+    timeout: int
 
 
 def load_config(config_path: str) -> configparser.ConfigParser:
-    """Загружает конфиг и проверяет обязательные параметры."""
+    """Загружает конфиг и проверяет базовые секции и параметры."""
     config = configparser.ConfigParser()
     try:
         read_files = config.read(config_path, encoding="utf-8")
@@ -66,20 +100,8 @@ def load_config(config_path: str) -> configparser.ConfigParser:
     if "browser" not in config:
         logging.error("В конфиге отсутствует секция [browser]")
         sys.exit(1)
-
-    if not config.get("redmine", "issue_url", fallback="").strip():
-        logging.error("В секции [redmine] не задан обязательный параметр 'issue_url'")
-        sys.exit(1)
     if not config.get("browser", "mode", fallback="").strip():
         logging.error("В секции [browser] не задан обязательный параметр 'mode'")
-        sys.exit(1)
-
-    comment_text = config.get("redmine", "comment_text", fallback="").strip()
-    comment_file = config.get("redmine", "comment_file", fallback="").strip()
-    if not comment_text and not comment_file:
-        logging.error(
-            "В секции [redmine] должен быть задан либо 'comment_text', либо 'comment_file'"
-        )
         sys.exit(1)
 
     mode = config.get("browser", "mode").strip().lower()
@@ -90,30 +112,208 @@ def load_config(config_path: str) -> configparser.ConfigParser:
     return config
 
 
-def read_comment_text(config: configparser.ConfigParser) -> str:
-    """Читает текст комментария из comment_file (приоритет) или comment_text."""
-    comment_file = config.get("redmine", "comment_file", fallback="").strip()
-    if comment_file:
-        path = Path(comment_file)
-        if not path.is_absolute():
-            path = SCRIPT_DIR / path
-        try:
-            text = path.read_text(encoding="utf-8").strip()
-        except OSError as exc:
-            logging.error("Не удалось прочитать comment_file %s: %s", path, exc)
+def parse_prepare_sections(config: configparser.ConfigParser) -> dict:
+    """Собирает описания всех парсеров из секций [prepare:*]."""
+    specs = {}
+    for section in config.sections():
+        if not section.startswith(PREPARE_SECTION_PREFIX):
+            continue
+        name = section[len(PREPARE_SECTION_PREFIX):].strip()
+        if not name:
+            logging.error("Секция [%s]: пустое имя парсера", section)
             sys.exit(1)
-        except UnicodeDecodeError as exc:
-            logging.error("comment_file %s не в UTF-8: %s", path, exc)
+        script_raw = config.get(section, "script", fallback="").strip()
+        if not script_raw:
+            logging.error("Секция [%s]: не задан обязательный параметр 'script'", section)
             sys.exit(1)
-        if not text:
-            logging.error("Файл comment_file %s пустой.", path)
-            sys.exit(1)
-        logging.info("Текст комментария прочитан из файла: %s (%d символов)", path, len(text))
-        return text
+        script = Path(script_raw)
+        if not script.is_absolute():
+            script = SCRIPT_DIR / script
+        args_raw = config.get(section, "args", fallback="").strip()
+        args = shlex.split(args_raw) if args_raw else []
+        timeout = config.getint(section, "timeout", fallback=DEFAULT_PARSER_TIMEOUT)
+        specs[name] = PrepareSpec(name=name, script=script, args=args, timeout=timeout)
+        logging.info("[prepare:%s] скрипт=%s, timeout=%d", name, script, timeout)
+    return specs
 
-    text = config.get("redmine", "comment_text", fallback="").strip()
-    logging.info("Текст комментария взят из comment_text (%d символов)", len(text))
-    return text
+
+def parse_tasks(config: configparser.ConfigParser) -> list:
+    """Собирает задачи из [task:*]. Валидирует URL, файлы, текст и prepare."""
+    task_sections = [s for s in config.sections() if s.startswith(TASK_SECTION_PREFIX)]
+    if not task_sections:
+        legacy_url = config.get("redmine", "issue_url", fallback="").strip()
+        if legacy_url:
+            logging.error(
+                "В конфиге нет секций [task:*], но найдена устаревшая [redmine] issue_url. "
+                "Начиная с v2.0 задачи задаются секциями вида [task:<метка>]. "
+                "Перенесите issue_url и comment_file в секцию [task:...]."
+            )
+        else:
+            logging.error(
+                "В конфиге нет ни одной секции [task:<метка>]. "
+                "Добавьте хотя бы одну. Подробнее — раздел «Настройка задач» в readme.md."
+            )
+        sys.exit(1)
+
+    tasks = []
+    for section in task_sections:
+        label = section[len(TASK_SECTION_PREFIX):].strip() or section
+        issue_url = config.get(section, "issue_url", fallback="").strip()
+        if not issue_url:
+            logging.error("Секция [%s]: не задан обязательный параметр 'issue_url'", section)
+            sys.exit(1)
+
+        prepare_raw = config.get(section, "prepare", fallback="").strip()
+        prepare_list = [p.strip() for p in prepare_raw.split(",") if p.strip()] if prepare_raw else []
+        for pname in prepare_list:
+            prepare_section = f"{PREPARE_SECTION_PREFIX}{pname}"
+            if not config.has_section(prepare_section):
+                logging.error(
+                    "Секция [%s]: указан prepare=%s, но секция [%s] отсутствует",
+                    section, pname, prepare_section,
+                )
+                sys.exit(1)
+
+        files_raw = config.get(section, "comment_files", fallback="")
+        file_entries = [line.strip() for line in files_raw.splitlines() if line.strip()]
+        inline = config.get(section, "comment_text", fallback="").strip()
+
+        if not file_entries and not inline:
+            logging.error(
+                "Секция [%s]: задайте 'comment_files' или 'comment_text'.", section
+            )
+            sys.exit(1)
+
+        resolved = []
+        for entry in file_entries:
+            p = Path(entry)
+            if not p.is_absolute():
+                p = SCRIPT_DIR / p
+            if not p.is_file():
+                logging.error("Секция [%s]: файл не найден — %s", section, p)
+                sys.exit(1)
+            resolved.append(p)
+
+        try:
+            text = _assemble_comment(section, resolved, inline)
+        except ValueError as exc:
+            logging.error("Секция [%s]: %s", section, exc)
+            sys.exit(1)
+
+        if resolved:
+            source = "файлы: " + ", ".join(p.name for p in resolved)
+        else:
+            source = "inline comment_text"
+
+        prepare_str = ", ".join(prepare_list) if prepare_list else "—"
+        tasks.append(Task(label=label, issue_url=issue_url, comment_text=text,
+                          source=source, prepare=prepare_list))
+        logging.info("[%s] задача принята: %s (%s, %d символов, prepare=%s)",
+                     label, issue_url, source, len(text), prepare_str)
+
+    return tasks
+
+
+def _assemble_comment(section: str, files: list, inline: str) -> str:
+    """Собирает текст комментария из файлов (приоритет) или inline."""
+    if not files:
+        return inline
+    parts = []
+    for path in files:
+        try:
+            content = path.read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            raise ValueError(f"не удалось прочитать {path}: {exc}")
+        except UnicodeDecodeError as exc:
+            raise ValueError(f"{path} не в UTF-8: {exc}")
+        if not content:
+            logging.warning("Секция [%s]: файл %s пустой — пропускаю.", section, path)
+            continue
+        parts.append(content)
+    if not parts:
+        raise ValueError("все файлы пустые")
+    return "\n\n".join(parts)
+
+
+def _tail(text: str, lines: int = 20) -> str:
+    """Возвращает последние `lines` строк текста."""
+    parts = text.strip().splitlines()
+    return "\n".join(parts[-lines:])
+
+
+def run_parser(spec: PrepareSpec, config_path: Path) -> bool:
+    """Запускает парсер. Возвращает True при коде 0, иначе False."""
+    if not spec.script.is_file():
+        logging.error("[prepare:%s] скрипт не найден: %s", spec.name, spec.script)
+        return False
+    if spec.script.suffix == ".py":
+        base = [sys.executable, str(spec.script)]
+    else:
+        if not os.access(str(spec.script), os.X_OK):
+            logging.error("[prepare:%s] скрипт не исполняемый: %s", spec.name, spec.script)
+            return False
+        base = [str(spec.script)]
+
+    cmd = base + ["--config", str(config_path)] + spec.args
+    logging.info("[prepare:%s] запуск: %s", spec.name, " ".join(shlex.quote(x) for x in cmd))
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=str(SCRIPT_DIR),
+            capture_output=True,
+            text=True,
+            timeout=spec.timeout,
+        )
+    except subprocess.TimeoutExpired:
+        logging.error("[prepare:%s] таймаут %d с", spec.name, spec.timeout)
+        return False
+    except OSError as exc:
+        logging.error("[prepare:%s] не удалось запустить: %s", spec.name, exc)
+        return False
+
+    if proc.returncode != 0:
+        logging.error("[prepare:%s] завершился с кодом %d", spec.name, proc.returncode)
+        if proc.stderr.strip():
+            logging.error("[prepare:%s] stderr (последние строки):\n%s",
+                          spec.name, _tail(proc.stderr))
+        return False
+
+    logging.info("[prepare:%s] успешно завершён", spec.name)
+    if proc.stdout.strip():
+        logging.info("[prepare:%s] вывод (последние строки):\n%s",
+                     spec.name, _tail(proc.stdout, 5))
+    return True
+
+
+def _ordered_parsers_for_tasks(tasks: list, prepare_specs: dict) -> list:
+    """Уникальные имена парсеров, на которые ссылаются задачи, в порядке [prepare:*]."""
+    referenced = set()
+    for t in tasks:
+        referenced.update(t.prepare)
+    return [name for name in prepare_specs if name in referenced]
+
+
+def _ensure_parsers(task: Task, prepare_specs: dict, config_path: Path,
+                    parser_cache: set, parser_status: dict) -> bool:
+    """Гарантирует, что все парсеры задачи запущены и успешны (с кэшем на прогон)."""
+    for name in task.prepare:
+        if name in parser_cache:
+            if not parser_status.get(name, False):
+                return False
+            continue
+        spec = prepare_specs.get(name)
+        if spec is None:
+            logging.error("[%s] нет секции [prepare:%s]", task.label, name)
+            parser_status[name] = False
+            parser_cache.add(name)
+            return False
+        logging.info("[%s] запускаю парсер %s", task.label, name)
+        ok = run_parser(spec, config_path)
+        parser_status[name] = ok
+        parser_cache.add(name)
+        if not ok:
+            return False
+    return True
 
 
 def resolve_driver_path(config: configparser.ConfigParser):
@@ -206,18 +406,18 @@ def build_driver(config: configparser.ConfigParser):
         sys.exit(1)
 
 
-def show_update_form(driver: webdriver.Chrome, timeout: int) -> bool:
+def show_update_form(driver: webdriver.Chrome, timeout: int, prefix: str = "") -> bool:
     """Делает видимой форму редактирования (#update) на странице задачи."""
     try:
         update = WebDriverWait(driver, timeout).until(
             EC.presence_of_element_located((By.ID, "update"))
         )
     except TimeoutException:
-        logging.error("Блок #update не найден на странице задачи.")
+        logging.error("%sБлок #update не найден на странице задачи.", prefix)
         return False
 
     if update.is_displayed():
-        logging.info("Форма редактирования уже открыта.")
+        logging.info("%sФорма редактирования уже открыта.", prefix)
         return True
 
     try:
@@ -229,9 +429,9 @@ def show_update_form(driver: webdriver.Chrome, timeout: int) -> bool:
             "  if (el) { el.style.display = ''; }"
             "}"
         )
-        logging.info("Форма редактирования открыта через showAndScrollTo.")
+        logging.info("%sФорма редактирования открыта.", prefix)
     except WebDriverException as exc:
-        logging.error("Не удалось открыть форму редактирования: %s", exc)
+        logging.error("%sНе удалось открыть форму редактирования: %s", prefix, exc)
         return False
 
     try:
@@ -239,18 +439,18 @@ def show_update_form(driver: webdriver.Chrome, timeout: int) -> bool:
             EC.visibility_of_element_located((By.ID, "issue_notes"))
         )
     except TimeoutException:
-        logging.error("Поле #issue_notes не стало видимым после showAndScrollTo.")
+        logging.error("%sПоле #issue_notes не стало видимым после showAndScrollTo.", prefix)
         return False
 
     return True
 
 
-def fill_notes_field(driver: webdriver.Chrome, notes_field_id: str, text: str) -> bool:
+def fill_notes_field(driver: webdriver.Chrome, notes_field_id: str, text: str, prefix: str = "") -> bool:
     """Вводит текст в поле комментария. Fallback на JS, если send_keys блокируется."""
     try:
         notes = driver.find_element(By.ID, notes_field_id)
     except WebDriverException as exc:
-        logging.error("Поле #%s не найдено: %s", notes_field_id, exc)
+        logging.error("%sПоле #%s не найдено: %s", prefix, notes_field_id, exc)
         return False
 
     try:
@@ -267,10 +467,10 @@ def fill_notes_field(driver: webdriver.Chrome, notes_field_id: str, text: str) -
     try:
         notes.clear()
         notes.send_keys(text)
-        logging.info("Текст введён через send_keys.")
+        logging.info("%sТекст введён через send_keys.", prefix)
         return True
     except WebDriverException as exc:
-        logging.warning("send_keys не удался (%s), пробую через JS.", exc)
+        logging.warning("%ssend_keys не удался (%s), пробую через JS.", prefix, exc)
 
     try:
         driver.execute_script(
@@ -279,14 +479,14 @@ def fill_notes_field(driver: webdriver.Chrome, notes_field_id: str, text: str) -
             "el.dispatchEvent(new Event('change', {bubbles: true}));",
             notes, text,
         )
-        logging.info("Текст установлен через JavaScript.")
+        logging.info("%sТекст установлен через JavaScript.", prefix)
         return True
     except WebDriverException as exc:
-        logging.error("JS-вставка не удалась: %s", exc)
+        logging.error("%sJS-вставка не удалась: %s", prefix, exc)
         return False
 
 
-def submit_form(driver: webdriver.Chrome, timeout: int) -> bool:
+def submit_form(driver: webdriver.Chrome, timeout: int, prefix: str = "") -> bool:
     """Нажимает кнопку «Отправить» именно в форме редактирования #issue-form."""
     try:
         button = WebDriverWait(driver, timeout).until(
@@ -295,14 +495,14 @@ def submit_form(driver: webdriver.Chrome, timeout: int) -> bool:
             )
         )
         button.click()
-        logging.info("Кнопка «Отправить» нажата.")
+        logging.info("%sКнопка «Отправить» нажата.", prefix)
         return True
     except (TimeoutException, WebDriverException) as exc:
-        logging.error("Не удалось нажать кнопку «Отправить»: %s", exc)
+        logging.error("%sНе удалось нажать кнопку «Отправить»: %s", prefix, exc)
         return False
 
 
-def verify_comment(driver: webdriver.Chrome, comment_text: str, timeout: int) -> bool:
+def verify_comment(driver: webdriver.Chrome, comment_text: str, timeout: int, prefix: str = "") -> bool:
     """Ждёт появления текста комментария в блоке истории задачи."""
     marker = comment_text[:50]
     try:
@@ -311,45 +511,120 @@ def verify_comment(driver: webdriver.Chrome, comment_text: str, timeout: int) ->
         )
         return True
     except TimeoutException:
-        logging.warning("Текст не найден в #history за %s с.", timeout)
+        logging.warning("%sТекст не найден в #history за %s с.", prefix, timeout)
     try:
         return marker in driver.page_source
     except WebDriverException:
         return False
 
 
-def add_comment(driver: webdriver.Chrome, config: configparser.ConfigParser) -> bool:
-    """Открывает задачу, показывает форму, вводит текст, отправляет, проверяет."""
-    issue_url = config.get("redmine", "issue_url").strip()
+def process_task(driver: webdriver.Chrome, task: Task, config: configparser.ConfigParser) -> bool:
+    """Обрабатывает одну задачу: открыть URL, показать форму, ввести, отправить, проверить."""
     timeout = config.getint("redmine", "timeout", fallback=DEFAULT_TIMEOUT)
     wait_after = config.getint("redmine", "wait_after_submit", fallback=DEFAULT_WAIT_AFTER_SUBMIT)
     notes_field_id = config.get("redmine", "notes_field_id", fallback=DEFAULT_NOTES_FIELD_ID).strip()
-
-    comment_text = read_comment_text(config)
+    prefix = f"[{task.label}] "
 
     try:
-        logging.info("Открываю задачу: %s", issue_url)
-        driver.get(issue_url)
+        logging.info("%sОткрываю задачу: %s", prefix, task.issue_url)
+        driver.get(task.issue_url)
     except WebDriverException as exc:
-        logging.error("Не удалось открыть URL: %s", exc)
+        logging.error("%sНе удалось открыть URL: %s", prefix, exc)
         return False
 
-    if not show_update_form(driver, timeout):
+    if not show_update_form(driver, timeout, prefix):
         return False
 
-    if not fill_notes_field(driver, notes_field_id, comment_text):
-        logging.error("Не удалось ввести текст комментария.")
+    if not fill_notes_field(driver, notes_field_id, task.comment_text, prefix):
+        logging.error("%sНе удалось ввести текст комментария.", prefix)
         return False
 
-    if not submit_form(driver, timeout):
+    if not submit_form(driver, timeout, prefix):
         return False
 
     time.sleep(wait_after)
-    if verify_comment(driver, comment_text, timeout):
-        logging.info("Комментарий добавлен.")
+    if verify_comment(driver, task.comment_text, timeout, prefix):
+        logging.info("%sКомментарий добавлен.", prefix)
         return True
-    logging.warning("Текст комментария не найден на странице после отправки.")
+    logging.warning("%sТекст комментария не найден на странице после отправки.", prefix)
     return False
+
+
+def run_tasks(config: configparser.ConfigParser, tasks: list, prepare_specs: dict,
+              config_path: Path) -> int:
+    """Прогон по задачам. Возвращает код выхода."""
+    prepare_all = config.getboolean("redmine", "prepare_all", fallback=False)
+    parser_cache = set()
+    parser_status = {}
+
+    if prepare_all:
+        ordered = _ordered_parsers_for_tasks(tasks, prepare_specs)
+        if ordered:
+            logging.info("prepare_all=true: запуск парсеров до цикла (%d)", len(ordered))
+            for name in ordered:
+                spec = prepare_specs.get(name)
+                if spec is None:
+                    logging.error("Задача ссылается на несуществующий парсер [prepare:%s]", name)
+                    parser_status[name] = False
+                else:
+                    parser_status[name] = run_parser(spec, config_path)
+                parser_cache.add(name)
+        else:
+            logging.info("prepare_all=true, но ни одна задача не ссылается на парсеры")
+
+    logging.info("Задач к обработке: %d", len(tasks))
+    driver = None
+    was_launched_here = False
+    ok_count = 0
+    failed_labels = []
+
+    try:
+        driver, was_launched_here = build_driver(config)
+        pause = config.getint("redmine", "task_pause", fallback=DEFAULT_TASK_PAUSE)
+        total = len(tasks)
+        for idx, task in enumerate(tasks, 1):
+            logging.info("=== Задача %d/%d [%s] ===", idx, total, task.label)
+
+            if prepare_all:
+                prep_ok = all(parser_status.get(n, False) for n in task.prepare)
+            else:
+                prep_ok = _ensure_parsers(task, prepare_specs, config_path, parser_cache, parser_status)
+
+            if not prep_ok:
+                logging.error("[%s] пропущена: парсер подготовки не отработал", task.label)
+                failed_labels.append(task.label)
+                if idx < total and pause > 0:
+                    time.sleep(pause)
+                continue
+
+            try:
+                success = process_task(driver, task, config)
+            except Exception as exc:
+                logging.error("[%s] Непредвиденная ошибка: %s", task.label, exc)
+                success = False
+            if success:
+                ok_count += 1
+            else:
+                failed_labels.append(task.label)
+            if idx < total and pause > 0:
+                logging.info("Пауза %d с перед следующей задачей.", pause)
+                time.sleep(pause)
+    finally:
+        if driver is not None:
+            close_after = config.getboolean("browser", "close_after", fallback=DEFAULT_CLOSE_AFTER)
+            if was_launched_here and close_after:
+                driver.quit()
+                logging.info("Браузер закрыт (close_after = true).")
+            else:
+                logging.info("Браузер оставлен открытым.")
+
+    total = len(tasks)
+    logging.info("Итого: обработано %d, успешно %d, с ошибкой %d",
+                 total, ok_count, len(failed_labels))
+    if failed_labels:
+        logging.error("Задачи с ошибками: %s", ", ".join(failed_labels))
+        return 1
+    return 0
 
 
 def run_login(config: configparser.ConfigParser) -> None:
@@ -357,13 +632,15 @@ def run_login(config: configparser.ConfigParser) -> None:
     logging.info("Старт run_login.")
     binary = config.get("browser", "browser_binary", fallback=DEFAULT_BROWSER_BINARY).strip()
     profile_dir = resolve_profile_dir(config)
-    issue_url = config.get("redmine", "issue_url").strip()
+    login_url = config.get("redmine", "login_url", fallback="").strip()
     log_path = Path(profile_dir) / LOGIN_LOG_NAME
 
     extra_args = config.get("browser", "login_extra_args", fallback="").strip()
     extra = shlex.split(extra_args) if extra_args else []
 
-    cmd = [binary, f"--user-data-dir={profile_dir}"] + extra + [issue_url]
+    cmd = [binary, f"--user-data-dir={profile_dir}"] + extra
+    if login_url:
+        cmd.append(login_url)
     logging.info("Команда запуска: %s", " ".join(shlex.quote(x) for x in cmd))
     logging.info("Лог Chromium: %s", log_path)
 
@@ -394,10 +671,16 @@ def run_login(config: configparser.ConfigParser) -> None:
         logging.warning("Браузер завершился с кодом %s. Лог Chromium: %s", exit_code, log_path)
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Добавление комментария в Redmine через браузер")
-    parser.add_argument("--config", default="config.ini", help="Путь к config.ini (по умолчанию config.ini в текущем каталоге)")
-    parser.add_argument("--login", action="store_true", help="Одноразовый вход в Redmine")
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Добавление комментариев к задачам Redmine через браузер")
+    parser.add_argument("--config", default="config.ini",
+                        help="Путь к config.ini (по умолчанию config.ini в папке скрипта)")
+    parser.add_argument("--login", action="store_true",
+                        help="Одноразовый вход в Redmine")
+    parser.add_argument("--prepare", metavar="NAME",
+                        help="Запустить один парсер (секция [prepare:NAME]) и выйти, без отправки комментариев")
+    parser.add_argument("--prepare-all", action="store_true",
+                        help="Запустить все парсеры из секций [prepare:*] и выйти, без отправки комментариев")
     args = parser.parse_args()
 
     script_log = SCRIPT_DIR / SCRIPT_LOG_NAME
@@ -409,32 +692,44 @@ def main() -> None:
             logging.FileHandler(script_log, mode="w", encoding="utf-8"),
         ],
     )
-    logging.info("=== Запуск redmine_commenter (v1.10), args=%s ===", vars(args))
+    logging.info("=== Запуск redmine_commenter (v2.2), args=%s ===", vars(args))
 
-    config = load_config(args.config)
+    config_path = Path(args.config)
+    if not config_path.is_absolute():
+        config_path = SCRIPT_DIR / config_path
+    config_path = config_path.resolve()
+    logging.info("Конфиг: %s", config_path)
+
+    config = load_config(str(config_path))
+
     if args.login:
         run_login(config)
-        sys.exit(0)
+        return 0
 
-    driver = None
-    was_launched_here = False
-    success = False
-    try:
-        driver, was_launched_here = build_driver(config)
-        success = add_comment(driver, config)
-    except Exception as exc:
-        logging.error("Непредвиденная ошибка: %s", exc)
-    finally:
-        if driver is not None:
-            close_after = config.getboolean("browser", "close_after", fallback=DEFAULT_CLOSE_AFTER)
-            if was_launched_here and close_after:
-                driver.quit()
-                logging.info("Браузер закрыт (close_after = true).")
-            else:
-                logging.info("Браузер оставлен открытым.")
+    if args.prepare:
+        specs = parse_prepare_sections(config)
+        spec = specs.get(args.prepare)
+        if spec is None:
+            logging.error("Нет секции [prepare:%s] в конфиге", args.prepare)
+            return 1
+        return 0 if run_parser(spec, config_path) else 1
 
-    sys.exit(0 if success else 1)
+    if args.prepare_all:
+        specs = parse_prepare_sections(config)
+        if not specs:
+            logging.error("В конфиге нет ни одной секции [prepare:*]")
+            return 1
+        ok = True
+        for name, spec in specs.items():
+            logging.info("Запуск парсера %s", name)
+            if not run_parser(spec, config_path):
+                ok = False
+        return 0 if ok else 1
+
+    tasks = parse_tasks(config)
+    prepare_specs = parse_prepare_sections(config)
+    return run_tasks(config, tasks, prepare_specs, config_path)
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
