@@ -1,6 +1,6 @@
 # redmine_commenter
 
-Версия v1.14.
+Версия v1.13.
 
 Скрипт добавляет комментарий к задаче Redmine через браузер, когда REST API и приём почты недоступны. Работает с выделенным профилем браузера: один раз войти — дальше без ручного вмешательства.
 
@@ -154,7 +154,7 @@
 
 Пример для cron (каждый день в 09:00). Используется полный путь к интерпретатору venv:
 
-    0 9 * * * cd /home/username/redmine_commenter && /home/username/redmine_commenter/.venv/bin/python3 redmine_commenter.py >> /home/username/redmine_commenter/cron.log 2>&1
+    0 9 * * * cd /home/username/redmine_commenter && /home/username/redmine_commenter/.venv/bin/python3 redmine_commenter.py --config config.ini >> /home/username/redmine_commenter/cron.log 2>&1
 
 Для cron рекомендуется в `config.ini` установить `close_after = true` или `headless = true`, чтобы не оставлять открытое окно.
 
@@ -180,10 +180,6 @@
 - Убедитесь, что порт `9222` доступен только локально.
 
 ## История изменений
-
-### v1.14 — 2026-11-05
-
-- Убран избыточный `--config config.ini` из примера cron (параметр опционален, значение по умолчанию — `config.ini`).
 
 ### v1.13 — 2026-11-05
 
