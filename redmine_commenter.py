@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Версия: v2.2
+# Версия: v2.5
 """
 Добавляет комментарии к нескольким задачам Redmine через браузер.
 Задачи задаются секциями [task:<метка>]. Для каждой задачи текст
@@ -10,6 +10,17 @@
 prepare_all = true, все парсеры, на которые ссылаются задачи, запускаются
 до цикла. Один и тот же парсер в рамках одного прогона не запускается
 дважды (кэш).
+
+Файлы из comment_files могут содержать разделитель "--- SENT ---".
+В этом случае для отправки берётся ТОЛЬКО часть до разделителя (таблица pending).
+Сам разделитель и часть после него (sent) в комментарий Redmine не попадают.
+После успешной отправки pending перемещается под разделитель (sent).
+Это позволяет не отправлять одни и те же ссылки повторно.
+
+Длинный текст разбивается на части (max_comment_length), каждая часть
+отправляется отдельным комментарием. Это обходит ограничение Redmine
+на размер поля notes (65535 символов). Ввод текста выполняется через
+JavaScript, что мгновенно и не зависит от длины текста.
 
 Режимы работы:
   (без флагов)         — обычный прогон по задачам;
@@ -25,6 +36,7 @@ import argparse
 import configparser
 import logging
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -55,6 +67,12 @@ DEFAULT_PARSER_TIMEOUT = 600
 DEFAULT_NOTES_FIELD_ID = "issue_notes"
 DEFAULT_SUBMIT_BUTTON_NAME = "commit"
 
+# По умолчанию ограничиваем размер одного комментария, чтобы не упереться
+# в лимит Redmine (65535 символов).
+DEFAULT_MAX_COMMENT_LENGTH = 50000
+
+SENT_MARKER = "--- SENT ---"
+
 DRIVER_NAMES = ("chromedriver", "yandexdriver")
 SCRIPT_DIR = Path(__file__).resolve().parent
 LOGIN_LOG_NAME = "chromium_login.log"
@@ -65,10 +83,11 @@ PREPARE_SECTION_PREFIX = "prepare:"
 
 @dataclass
 class Task:
-    """Одна задача: метка, URL, готовый текст, источник и список парсеров."""
+    """Одна задача: метка, URL, файлы с текстом, inline-текст и список парсеров."""
     label: str
     issue_url: str
-    comment_text: str
+    comment_files: list
+    inline_text: str
     source: str
     prepare: list = field(default_factory=list)
 
@@ -138,7 +157,7 @@ def parse_prepare_sections(config: configparser.ConfigParser) -> dict:
 
 
 def parse_tasks(config: configparser.ConfigParser) -> list:
-    """Собирает задачи из [task:*]. Валидирует URL, файлы, текст и prepare."""
+    """Собирает задачи из [task:*]. Валидирует URL, файлы и prepare."""
     task_sections = [s for s in config.sections() if s.startswith(TASK_SECTION_PREFIX)]
     if not task_sections:
         legacy_url = config.get("redmine", "issue_url", fallback="").strip()
@@ -194,45 +213,166 @@ def parse_tasks(config: configparser.ConfigParser) -> list:
                 sys.exit(1)
             resolved.append(p)
 
-        try:
-            text = _assemble_comment(section, resolved, inline)
-        except ValueError as exc:
-            logging.error("Секция [%s]: %s", section, exc)
-            sys.exit(1)
-
         if resolved:
             source = "файлы: " + ", ".join(p.name for p in resolved)
         else:
             source = "inline comment_text"
 
         prepare_str = ", ".join(prepare_list) if prepare_list else "—"
-        tasks.append(Task(label=label, issue_url=issue_url, comment_text=text,
-                          source=source, prepare=prepare_list))
-        logging.info("[%s] задача принята: %s (%s, %d символов, prepare=%s)",
-                     label, issue_url, source, len(text), prepare_str)
+        tasks.append(Task(label=label, issue_url=issue_url, comment_files=resolved,
+                          inline_text=inline, source=source, prepare=prepare_list))
+        logging.info("[%s] задача принята: %s (%s, prepare=%s)",
+                     label, issue_url, source, prepare_str)
 
     return tasks
 
 
-def _assemble_comment(section: str, files: list, inline: str) -> str:
-    """Собирает текст комментария из файлов (приоритет) или inline."""
-    if not files:
-        return inline
+def has_sent_marker(path: Path) -> bool:
+    """Проверяет, содержит ли файл разделитель отправленных комментариев."""
+    try:
+        return SENT_MARKER in path.read_text(encoding="utf-8")
+    except OSError:
+        return False
+
+
+def read_comment_file(path: Path) -> tuple:
+    """Читает файл с текстом комментария.
+    
+    Возвращает (текст, has_marker, is_empty_pending).
+    Если файл содержит разделитель, возвращает ТОЛЬКО часть до него (pending).
+    Сам разделитель и часть после него в текст комментария не попадают.
+    Если pending пуст (нет строк данных), возвращает ("", True, True).
+    """
+    try:
+        content = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ValueError(f"не удалось прочитать {path}: {exc}")
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"{path} не в UTF-8: {exc}")
+
+    if SENT_MARKER in content:
+        parts = content.split(SENT_MARKER, 1)
+        pending = parts[0].strip()
+        lines = [l for l in pending.splitlines()
+                 if l.strip().startswith("|") and not l.strip().startswith("|_.")]
+        if not lines:
+            return "", True, True
+        return pending, True, False
+    else:
+        return content.strip(), False, False
+
+
+def mark_file_sent(path: Path) -> None:
+    """Перемещает pending-часть файла под разделитель (в sent)."""
+    try:
+        content = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        logging.error("Не удалось прочитать %s для пометки отправки: %s", path, exc)
+        return
+
+    if SENT_MARKER not in content:
+        return
+
+    parts = content.split(SENT_MARKER, 1)
+    pending_part = parts[0]
+    sent_part = parts[1] if len(parts) > 1 else ""
+
+    pending_lines = pending_part.splitlines()
+    header_lines = []
+    data_lines = []
+    for line in pending_lines:
+        stripped = line.strip()
+        if stripped.startswith("|_."):
+            header_lines.append(line)
+        elif stripped.startswith("|"):
+            data_lines.append(line)
+
+    if not data_lines:
+        return
+
+    sent_lines = [l for l in sent_part.splitlines() if l.strip().startswith("|")]
+    new_sent_lines = sent_lines + data_lines
+
+    new_pending = "\n".join(header_lines) + "\n" if header_lines else ""
+    new_sent = "\n".join(new_sent_lines) + "\n"
+    new_content = new_pending + SENT_MARKER + "\n" + new_sent
+
+    try:
+        path.write_text(new_content, encoding="utf-8")
+        logging.info("Файл %s: %d строк перемещено в отправленные", path, len(data_lines))
+    except OSError as exc:
+        logging.error("Не удалось записать %s: %s", path, exc)
+
+
+def assemble_comment(task: Task) -> tuple:
+    """Собирает текст комментария из файлов или inline.
+    
+    Возвращает (текст, причина_пропуска).
+    Если причина_пропуска не None — задачу нужно пропустить (не ошибка).
+    """
+    if task.comment_files:
+        parts = []
+        has_marker_files = 0
+        empty_marker_files = 0
+        for path in task.comment_files:
+            try:
+                text, has_marker, is_empty = read_comment_file(path)
+            except ValueError as exc:
+                raise ValueError(str(exc))
+            if has_marker:
+                has_marker_files += 1
+                if is_empty:
+                    empty_marker_files += 1
+                    continue
+            if not text:
+                raise ValueError(f"файл {path} пуст")
+            parts.append(text)
+
+        if not parts:
+            if has_marker_files > 0 and empty_marker_files == has_marker_files:
+                return "", "все файлы с маркером не содержат новых записей"
+            raise ValueError("все файлы пусты")
+
+        return "\n\n".join(parts), None
+    else:
+        if not task.inline_text:
+            raise ValueError("пустой inline-текст")
+        return task.inline_text, None
+
+
+def split_comment_text(text: str, max_length: int) -> list:
+    """Разбивает текст на части, не превышающие max_length символов.
+    
+    Старается резать по границам строк, чтобы не разрывать таблицу или абзац.
+    """
+    if max_length <= 0 or len(text) <= max_length:
+        return [text]
+
     parts = []
-    for path in files:
-        try:
-            content = path.read_text(encoding="utf-8").strip()
-        except OSError as exc:
-            raise ValueError(f"не удалось прочитать {path}: {exc}")
-        except UnicodeDecodeError as exc:
-            raise ValueError(f"{path} не в UTF-8: {exc}")
-        if not content:
-            logging.warning("Секция [%s]: файл %s пустой — пропускаю.", section, path)
+    lines = text.splitlines(keepends=True)
+    current_chunk = []
+
+    for line in lines:
+        # Если одна строка сама по себе длиннее лимита — режем её принудительно.
+        if len(line) > max_length:
+            if current_chunk:
+                parts.append("".join(current_chunk))
+                current_chunk = []
+            for i in range(0, len(line), max_length):
+                parts.append(line[i:i + max_length])
             continue
-        parts.append(content)
-    if not parts:
-        raise ValueError("все файлы пустые")
-    return "\n\n".join(parts)
+
+        # Если добавление строки превысит лимит — начинаем новый блок.
+        if sum(len(l) for l in current_chunk) + len(line) > max_length:
+            parts.append("".join(current_chunk))
+            current_chunk = [line]
+        else:
+            current_chunk.append(line)
+
+    if current_chunk:
+        parts.append("".join(current_chunk))
+
+    return parts
 
 
 def _tail(text: str, lines: int = 20) -> str:
@@ -446,7 +586,12 @@ def show_update_form(driver: webdriver.Chrome, timeout: int, prefix: str = "") -
 
 
 def fill_notes_field(driver: webdriver.Chrome, notes_field_id: str, text: str, prefix: str = "") -> bool:
-    """Вводит текст в поле комментария. Fallback на JS, если send_keys блокируется."""
+    """Вводит текст в поле комментария через JavaScript.
+    
+    send_keys не используется: для больших текстов он работает очень медленно
+    и может обрываться. Прямая установка value через JS срабатывает мгновенно
+    и не зависит от объёма текста.
+    """
     try:
         notes = driver.find_element(By.ID, notes_field_id)
     except WebDriverException as exc:
@@ -460,26 +605,13 @@ def fill_notes_field(driver: webdriver.Chrome, notes_field_id: str, text: str, p
         pass
 
     try:
-        notes.click()
-    except WebDriverException:
-        pass
-
-    try:
-        notes.clear()
-        notes.send_keys(text)
-        logging.info("%sТекст введён через send_keys.", prefix)
-        return True
-    except WebDriverException as exc:
-        logging.warning("%ssend_keys не удался (%s), пробую через JS.", prefix, exc)
-
-    try:
         driver.execute_script(
             "var el = arguments[0]; el.value = arguments[1];"
             "el.dispatchEvent(new Event('input', {bubbles: true}));"
             "el.dispatchEvent(new Event('change', {bubbles: true}));",
             notes, text,
         )
-        logging.info("%sТекст установлен через JavaScript.", prefix)
+        logging.info("%sТекст установлен через JavaScript (%d символов).", prefix, len(text))
         return True
     except WebDriverException as exc:
         logging.error("%sJS-вставка не удалась: %s", prefix, exc)
@@ -518,13 +650,26 @@ def verify_comment(driver: webdriver.Chrome, comment_text: str, timeout: int, pr
         return False
 
 
-def process_task(driver: webdriver.Chrome, task: Task, config: configparser.ConfigParser) -> bool:
-    """Обрабатывает одну задачу: открыть URL, показать форму, ввести, отправить, проверить."""
+def process_task(driver: webdriver.Chrome, task: Task, comment_text: str,
+                 config: configparser.ConfigParser) -> bool:
+    """Обрабатывает одну задачу: открыть URL, показать форму, ввести, отправить, проверить.
+    
+    Если текст длиннее max_comment_length, он разбивается на несколько частей,
+    каждая отправляется отдельным комментарием.
+    """
     timeout = config.getint("redmine", "timeout", fallback=DEFAULT_TIMEOUT)
     wait_after = config.getint("redmine", "wait_after_submit", fallback=DEFAULT_WAIT_AFTER_SUBMIT)
     notes_field_id = config.get("redmine", "notes_field_id", fallback=DEFAULT_NOTES_FIELD_ID).strip()
+    max_length = config.getint("redmine", "max_comment_length", fallback=DEFAULT_MAX_COMMENT_LENGTH)
     prefix = f"[{task.label}] "
 
+    parts = split_comment_text(comment_text, max_length)
+    total_parts = len(parts)
+    if total_parts > 1:
+        logging.info("%sТекст разбит на %d частей (лимит %d символов).",
+                     prefix, total_parts, max_length)
+
+    # Открываем задачу один раз. Форма переиспользуется для всех частей.
     try:
         logging.info("%sОткрываю задачу: %s", prefix, task.issue_url)
         driver.get(task.issue_url)
@@ -535,19 +680,31 @@ def process_task(driver: webdriver.Chrome, task: Task, config: configparser.Conf
     if not show_update_form(driver, timeout, prefix):
         return False
 
-    if not fill_notes_field(driver, notes_field_id, task.comment_text, prefix):
-        logging.error("%sНе удалось ввести текст комментария.", prefix)
-        return False
+    for idx, part in enumerate(parts, 1):
+        part_prefix = f"{prefix}({idx}/{total_parts}) " if total_parts > 1 else prefix
 
-    if not submit_form(driver, timeout, prefix):
-        return False
+        # Перед каждой частью (кроме первой) нужно снова открыть форму:
+        # после отправки страница перезагружается, и #update снова скрывается.
+        if idx > 1:
+            if not show_update_form(driver, timeout, part_prefix):
+                return False
 
-    time.sleep(wait_after)
-    if verify_comment(driver, task.comment_text, timeout, prefix):
-        logging.info("%sКомментарий добавлен.", prefix)
-        return True
-    logging.warning("%sТекст комментария не найден на странице после отправки.", prefix)
-    return False
+        if not fill_notes_field(driver, notes_field_id, part, part_prefix):
+            logging.error("%sНе удалось ввести текст части %d.", part_prefix, idx)
+            return False
+
+        if not submit_form(driver, timeout, part_prefix):
+            return False
+
+        time.sleep(wait_after)
+        if not verify_comment(driver, part, timeout, part_prefix):
+            logging.warning("%sТекст части %d не найден на странице после отправки.", part_prefix, idx)
+            return False
+
+        logging.info("%sЧасть %d отправлена.", part_prefix, idx)
+
+    logging.info("%sВсе части отправлены.", prefix)
+    return True
 
 
 def run_tasks(config: configparser.ConfigParser, tasks: list, prepare_specs: dict,
@@ -577,6 +734,7 @@ def run_tasks(config: configparser.ConfigParser, tasks: list, prepare_specs: dic
     was_launched_here = False
     ok_count = 0
     failed_labels = []
+    skipped_labels = []
 
     try:
         driver, was_launched_here = build_driver(config)
@@ -598,14 +756,35 @@ def run_tasks(config: configparser.ConfigParser, tasks: list, prepare_specs: dic
                 continue
 
             try:
-                success = process_task(driver, task, config)
+                comment_text, skip_reason = assemble_comment(task)
+            except ValueError as exc:
+                logging.error("[%s] %s", task.label, exc)
+                failed_labels.append(task.label)
+                if idx < total and pause > 0:
+                    time.sleep(pause)
+                continue
+
+            if skip_reason:
+                logging.info("[%s] пропущена: %s", task.label, skip_reason)
+                skipped_labels.append(task.label)
+                if idx < total and pause > 0:
+                    time.sleep(pause)
+                continue
+
+            try:
+                success = process_task(driver, task, comment_text, config)
             except Exception as exc:
                 logging.error("[%s] Непредвиденная ошибка: %s", task.label, exc)
                 success = False
+
             if success:
                 ok_count += 1
+                for path in task.comment_files:
+                    if has_sent_marker(path):
+                        mark_file_sent(path)
             else:
                 failed_labels.append(task.label)
+
             if idx < total and pause > 0:
                 logging.info("Пауза %d с перед следующей задачей.", pause)
                 time.sleep(pause)
@@ -619,8 +798,8 @@ def run_tasks(config: configparser.ConfigParser, tasks: list, prepare_specs: dic
                 logging.info("Браузер оставлен открытым.")
 
     total = len(tasks)
-    logging.info("Итого: обработано %d, успешно %d, с ошибкой %d",
-                 total, ok_count, len(failed_labels))
+    logging.info("Итого: обработано %d, успешно %d, пропущено %d, с ошибкой %d",
+                 total, ok_count, len(skipped_labels), len(failed_labels))
     if failed_labels:
         logging.error("Задачи с ошибками: %s", ", ".join(failed_labels))
         return 1
@@ -692,7 +871,7 @@ def main() -> int:
             logging.FileHandler(script_log, mode="w", encoding="utf-8"),
         ],
     )
-    logging.info("=== Запуск redmine_commenter (v2.2), args=%s ===", vars(args))
+    logging.info("=== Запуск redmine_commenter (v2.5), args=%s ===", vars(args))
 
     config_path = Path(args.config)
     if not config_path.is_absolute():

@@ -1,0 +1,26 @@
+# Рабочий конфиг (реальные данные)
+config.ini
+
+# Драйверы браузеров (скачиваются пользователем отдельно, платформозависимы)
+chromedriver
+yandexdriver
+
+# Логи
+*.log
+
+# Виртуальное окружение Python
+.venv/
+venv/
+env/
+
+# Кэш Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Локальные артефакты проекта
+browser_profile/
+comment.txt
+rutube_links.txt
+bash.txt

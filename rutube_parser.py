@@ -1,15 +1,30 @@
 #!/usr/bin/env python3
-# Версия: v2.0
+# Версия: v2.6
 """
 Собирает ссылки на видео и Shorts с канала Rutube и сохраняет их в файл
 в виде таблицы Textile (формат Redmine).
 Ссылки очищаются от параметров плейлиста (остаётся только базовый URL).
 Дата публикации и заголовок запрашиваются через официальный API Rutube.
 
-Логика max_items:
-  - если sort_by_date = true: собираются все ссылки, сортируются по дате,
-    и только потом обрезаются до max_items (чтобы получить самые новые);
-  - если sort_by_date = false: прокрутка останавливается при достижении max_items.
+Формат файла:
+  1) таблица, подготовленная к отправке (pending);
+  2) разделитель "--- SENT ---";
+  3) ранее отправленные комментарии (sent).
+
+Новые ссылки добавляются в pending. Ссылки, уже находящиеся в pending или sent,
+повторно не добавляются. После успешной отправки redmine_commenter.py
+перемещает pending под разделитель.
+
+Логика сбора:
+  - Скрипт явно открывает вкладки /videos/ и /shorts/.
+  - Прокрутка через window.scrollTo.
+  - Шаблон ссылки: строгий "/[0-9a-f]{32}", чтобы отсечь пагинацию и служебные страницы.
+  - Остановка по любому условию:
+    - достигнут лимит max_items новых записей;
+    - исчерпан лимит max_duration (общий на прогон, секунды);
+    - 15 прокруток подряд не дали новых ссылок;
+    - количество ссылок в DOM стабилизировалось;
+    - достигнут max_scrolls.
 """
 
 import argparse
@@ -39,6 +54,8 @@ DEFAULT_TIMEOUT = 20
 DEFAULT_SCROLL_PAUSE = 2
 DEFAULT_MAX_SCROLLS = 200
 DEFAULT_SORT_BY_DATE = True
+DEFAULT_MAX_DURATION = 0
+SENT_MARKER = "--- SENT ---"
 DRIVER_NAMES = ("chromedriver", "yandexdriver")
 SCRIPT_DIR = Path(__file__).resolve().parent
 SCRIPT_LOG_NAME = "rutube_parser.log"
@@ -119,7 +136,7 @@ def normalize_channel_url(url: str) -> str:
 
 
 def get_channel_slug(driver: webdriver.Chrome, channel_url: str) -> str:
-    """Возвращает слаг канала (часть после /u/), если URL имеет вид /u/<slug>/."""
+    """Возвращает слаг канала (часть после /u/) или его числовой ID."""
     logging.info("Открываю канал: %s", channel_url)
     try:
         driver.get(channel_url)
@@ -155,15 +172,12 @@ def collect_from_page(
     link_pattern: re.Pattern,
     scroll_pause: int,
     max_scrolls: int,
-    max_items: int,      # 0 = без ограничения при сборе
+    max_items: int,
+    deadline,
     collected: list,
     seen: set,
 ) -> int:
-    """Прокручивает страницу и собирает уникальные ссылки.
-    
-    Если max_items > 0, сбор останавливается при достижении этого количества.
-    Если max_items == 0, собираются все ссылки до стабилизации страницы.
-    """
+    """Прокручивает страницу и собирает уникальные ссылки."""
     logging.info("Открываю страницу: %s", url)
     try:
         driver.get(url)
@@ -175,10 +189,18 @@ def collect_from_page(
         return 0
 
     added_count = 0
-    last_height = 0
+    last_dom_count = 0
     stable_rounds = 0
+    no_progress_rounds = 0
 
     for i in range(1, max_scrolls + 1):
+        if deadline is not None and time.time() > deadline:
+            logging.warning(
+                "Достигнут общий лимит времени (max_duration) — останавливаю сбор на %s.",
+                url,
+            )
+            break
+
         anchors = driver.find_elements(By.TAG_NAME, "a")
         new_this_round = 0
         for a in anchors:
@@ -186,13 +208,13 @@ def collect_from_page(
             match = link_pattern.search(href)
             if not match:
                 continue
-                
+
             kind = match.group(1)
             video_id = match.group(2)
-            
+
             if video_id in seen:
                 continue
-                
+
             seen.add(video_id)
             clean_url = f"https://rutube.ru/{kind}/{video_id}/"
             collected.append((video_id, clean_url))
@@ -206,19 +228,28 @@ def collect_from_page(
                 )
                 return added_count
 
+        if new_this_round == 0:
+            no_progress_rounds += 1
+        else:
+            no_progress_rounds = 0
+
         driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
         time.sleep(scroll_pause)
 
-        new_height = driver.execute_script("return document.body.scrollHeight;")
-        if new_height == last_height:
+        dom_video_links = driver.find_elements(
+            By.CSS_SELECTOR, "a[href*='/video/'], a[href*='/shorts/']"
+        )
+        new_dom_count = len(dom_video_links)
+
+        if new_dom_count == last_dom_count:
             stable_rounds += 1
         else:
             stable_rounds = 0
-        last_height = new_height
+        last_dom_count = new_dom_count
 
         logging.info(
-            "Прокрутка %d: всего %d ссылок (добавлено %d), высота %s",
-            i, len(collected), new_this_round, new_height,
+            "Прокрутка %d: всего %d ссылок (добавлено %d), ссылок на видео в DOM %d",
+            i, len(collected), new_this_round, new_dom_count,
         )
 
         if max_items > 0 and len(collected) >= max_items:
@@ -228,22 +259,23 @@ def collect_from_page(
             )
             break
 
+        if no_progress_rounds >= 15:
+            logging.info("15 прокруток подряд без новых ссылок — останавливаю сбор.")
+            break
+
         if stable_rounds >= 3:
-            logging.info("Высота страницы стабилизировалась — завершаю прокрутку.")
+            logging.info("Количество элементов в DOM стабилизировалось — завершаю прокрутку.")
             break
 
     return added_count
 
 
 def fetch_publication_data(video_id: str) -> tuple:
-    """Запрашивает заголовок и дату публикации через API Rutube.
-    
-    Возвращает (заголовок, timestamp). Если API не отвечает, возвращает ("", 0).
-    """
+    """Запрашивает заголовок и дату публикации через API Rutube."""
     if not video_id:
         return "", 0
     url = API_URL_TEMPLATE.format(video_id=video_id)
-    
+
     headers = {
         "User-Agent": USER_AGENT,
         "Referer": "https://rutube.ru/",
@@ -251,14 +283,14 @@ def fetch_publication_data(video_id: str) -> tuple:
         "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
     }
     req = urllib.request.Request(url, headers=headers)
-    
+
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
             data = json.loads(resp.read().decode("utf-8"))
             title = str(data.get("title", "")).strip()
-            
+
             raw_ts = data.get("publication_ts") or data.get("created_ts") or 0
-            
+
             ts = 0
             if isinstance(raw_ts, (int, float)):
                 ts = int(raw_ts)
@@ -271,7 +303,7 @@ def fetch_publication_data(video_id: str) -> tuple:
                         ts = int(raw_ts)
                     except ValueError:
                         logging.warning("Не удалось распознать дату '%s' для видео %s", raw_ts, video_id)
-            
+
             return title, ts
     except urllib.error.HTTPError as e:
         logging.warning("API HTTP %s для видео %s", e.code, video_id)
@@ -287,56 +319,141 @@ def fetch_publication_data(video_id: str) -> tuple:
         return "", 0
 
 
-def build_table_data(collected: list, sort_by_date: bool, max_items: int) -> list:
-    """Обогащает список ссылок заголовками и датами. Сортирует и обрезает."""
-    logging.info("Запрашиваю данные для %d ссылок...", len(collected))
+def parse_date_to_ts(date_str: str) -> int:
+    """Преобразует дату из таблицы (%d.%m.%Y) в timestamp."""
+    if not date_str:
+        return 0
+    try:
+        dt = datetime.strptime(date_str, "%d.%m.%Y")
+        return int(dt.timestamp())
+    except ValueError:
+        return 0
+
+
+def _parse_table_lines(lines: list) -> list:
+    """Парсит строки таблицы Textile. Пропускает шапку и некорректные строки."""
+    records = []
+    for line in lines:
+        line = line.strip()
+        if not line or not line.startswith("|"):
+            continue
+        if line.startswith("|_."):
+            continue
+        parts = line.split("|")
+        if len(parts) < 5:
+            continue
+        date_str = parts[1].strip()
+        title = parts[2].strip()
+        url = parts[3].strip()
+        if not url:
+            continue
+        m = re.search(r"/(video|shorts)/([0-9a-f]{32})/?", url)
+        video_id = m.group(2) if m else ""
+        records.append({
+            "ts": parse_date_to_ts(date_str),
+            "date_str": date_str,
+            "title": title,
+            "url": url,
+            "video_id": video_id,
+        })
+    return records
+
+
+def read_existing_table(output_path: Path) -> tuple:
+    """Читает существующий файл: возвращает (pending, sent, known_ids)."""
+    if not output_path.is_file():
+        return [], [], set()
+
+    try:
+        lines = output_path.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        logging.error("Не удалось прочитать существующий файл %s: %s", output_path, exc)
+        sys.exit(1)
+
+    pending_lines = []
+    sent_lines = []
+    in_sent = False
+    for line in lines:
+        if line.strip() == SENT_MARKER:
+            in_sent = True
+            continue
+        if in_sent:
+            sent_lines.append(line)
+        else:
+            pending_lines.append(line)
+
+    pending_records = _parse_table_lines(pending_lines)
+    sent_records = _parse_table_lines(sent_lines)
+
+    known_ids = set()
+    for r in pending_records + sent_records:
+        if r["video_id"]:
+            known_ids.add(r["video_id"])
+
+    non_empty = [l for l in lines if l.strip() and l.strip() != SENT_MARKER]
+    if non_empty and not pending_records and not sent_records:
+        logging.error(
+            "Файл %s существует и не пуст, но не содержит распознаваемых записей таблицы. "
+            "Переименуйте или удалите его, чтобы начать заново.",
+            output_path,
+        )
+        sys.exit(1)
+
+    logging.info("Прочитано %d ожидающих и %d отправленных записей из %s",
+                 len(pending_records), len(sent_records), output_path)
+    return pending_records, sent_records, known_ids
+
+
+def build_table_data(collected: list, sort_by_date: bool) -> list:
+    """Обогащает список новых ссылок заголовками и датами. Сортирует, если нужно."""
+    logging.info("Запрашиваю данные для %d новых ссылок...", len(collected))
     processed = []
-    
+
     for idx, (video_id, clean_url) in enumerate(collected, 1):
         title, ts = fetch_publication_data(video_id)
-        
+
         if ts > 0:
             date_str = datetime.fromtimestamp(ts).strftime('%d.%m.%Y')
         else:
             date_str = ""
-            
+
         if not title:
             title = "Без названия"
-            
+
         safe_title = title.replace("|", "&#124;").replace("\n", " ").replace("\r", " ")
-        
+
         processed.append({
             "ts": ts,
             "date_str": date_str,
             "title": safe_title,
             "url": clean_url,
+            "video_id": video_id,
         })
-        
+
         if idx % 50 == 0:
             logging.info("  обработано %d/%d", idx, len(collected))
-            
-        time.sleep(0.1)  # Небольшая пауза между запросами
-            
+
+        time.sleep(0.1)
+
     if sort_by_date:
         processed.sort(key=lambda x: x["ts"], reverse=True)
-        
-    # Обрезаем после сортировки, чтобы оставить самые новые
-    if max_items > 0 and len(processed) > max_items:
-        logging.info("Обрезаю до max_items=%d", max_items)
-        processed = processed[:max_items]
-        
-    logging.info("Данные получены для %d ссылок.", len(processed))
+
+    logging.info("Данные получены для %d новых ссылок.", len(processed))
     return processed
 
 
-def save_table(items: list, output_path: Path) -> None:
-    """Сохраняет таблицу в формате Textile для Redmine."""
+def save_table(pending_items: list, sent_items: list, output_path: Path) -> None:
+    """Сохраняет таблицу в формате Textile (шапка + pending + маркер + sent)."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, "w", encoding="utf-8") as f:
         f.write("|_.Дата публикации|_.Заголовок|_.Ссылка|\n")
-        for item in items:
+        for item in pending_items:
             f.write(f"|{item['date_str']}|{item['title']}|{item['url']}|\n")
-    logging.info("Сохранено %d строк в %s", len(items), output_path)
+        f.write(SENT_MARKER + "\n")
+        for item in sent_items:
+            f.write(f"|{item['date_str']}|{item['title']}|{item['url']}|\n")
+    logging.info("Сохранено %d ожидающих и %d отправленных строк в %s",
+                 len(pending_items), len(sent_items), output_path)
 
 
 def main() -> int:
@@ -358,7 +475,7 @@ def main() -> int:
             logging.FileHandler(script_log, mode="w", encoding="utf-8"),
         ],
     )
-    logging.info("=== Запуск rutube_parser (v2.0) ===")
+    logging.info("=== Запуск rutube_parser (v2.6) ===")
     logging.info("Конфиг: %s", config_path)
 
     config = load_config(str(config_path))
@@ -382,64 +499,85 @@ def main() -> int:
             logging.error("Параметр max_items должен быть целым числом, получено: %s", max_items_str)
             sys.exit(1)
 
+    max_duration = config.getint("rutube", "max_duration", fallback=DEFAULT_MAX_DURATION)
+    if max_duration < 0:
+        logging.error("Параметр max_duration не может быть отрицательным: %d", max_duration)
+        sys.exit(1)
+
     sort_by_date = config.getboolean("rutube", "sort_by_date", fallback=DEFAULT_SORT_BY_DATE)
 
     if max_items > 0:
         if sort_by_date:
-            logging.info("Ограничение max_items: %d (будет применено ПОСЛЕ сортировки по дате)", max_items)
+            logging.info("Ограничение max_items: %d новых записей (применяется ПОСЛЕ сортировки)", max_items)
         else:
-            logging.info("Ограничение max_items: %d (остановка при сборе)", max_items)
+            logging.info("Ограничение max_items: %d новых записей (остановка при сборе)", max_items)
     else:
-        logging.info("Ограничение max_items: не задано (собираем все)")
+        logging.info("Ограничение max_items: не задано (добавляем все новые)")
+
+    if max_duration > 0:
+        logging.info("Лимит времени на прогон: %d с", max_duration)
+    else:
+        logging.info("Лимит времени на прогон: не задан")
 
     if sort_by_date:
-        logging.info("Сортировка по дате публикации: включена")
+        logging.info("Сортировка по дате публикации: включена (pending)")
     else:
-        logging.info("Сортировка по дате публикации: отключена (порядок сбора)")
+        logging.info("Сортировка по дате публикации: отключена (pending сохраняет порядок)")
+
+    existing_pending, existing_sent, known_ids = read_existing_table(output_path)
+
+    deadline = time.time() + max_duration if max_duration > 0 else None
 
     driver = build_driver(config)
     try:
         identifier = get_channel_slug(driver, channel_url)
 
-        link_pattern = re.compile(r"rutube\.ru/(video|shorts)/([0-9a-f]+)")
+        # Строгий шаблон: ID видео и Shorts в Rutube — 32 hex-символа.
+        # Это автоматически отсекает пагинацию (page-2) и служебные страницы.
+        link_pattern = re.compile(r"/(video|shorts)/([0-9a-f]{32})")
 
-        main_url = (
-            f"https://rutube.ru/channel/{identifier}/" if identifier.isdigit()
-            else f"https://rutube.ru/u/{identifier}/"
-        )
+        if identifier.isdigit():
+            videos_url = f"https://rutube.ru/channel/{identifier}/videos/"
+            shorts_url = f"https://rutube.ru/channel/{identifier}/shorts/"
+        else:
+            videos_url = f"https://rutube.ru/u/{identifier}/videos/"
+            shorts_url = f"https://rutube.ru/u/{identifier}/shorts/"
 
         collected = []
-        seen = set()
+        seen = set(known_ids)
 
-        # Если сортируем по дате, не ограничиваем сбор (max_items=0),
-        # чтобы не потерять новые видео. Ограничение применим позже.
         collect_limit = 0 if sort_by_date else max_items
 
-        logging.info("Шаг 1: собираю с главной страницы канала (%s)", main_url)
+        logging.info("Шаг 1: собираю с %s", videos_url)
         collect_from_page(
-            driver, main_url, link_pattern,
-            scroll_pause, max_scrolls, collect_limit, collected, seen,
+            driver, videos_url, link_pattern,
+            scroll_pause, max_scrolls, collect_limit, deadline, collected, seen,
         )
-        
-        if not collected and (collect_limit == 0 or len(collected) < collect_limit):
-            videos_url = (
-                f"https://rutube.ru/channel/{identifier}/videos/" if identifier.isdigit()
-                else f"https://rutube.ru/u/{identifier}/videos/"
-            )
-            logging.info("На главной ничего не найдено — собираю с %s", videos_url)
+
+        if not (not sort_by_date and max_items > 0 and len(collected) >= max_items):
+            logging.info("Шаг 2: собираю с %s", shorts_url)
             collect_from_page(
-                driver, videos_url, link_pattern,
-                scroll_pause, max_scrolls, collect_limit, collected, seen,
+                driver, shorts_url, link_pattern,
+                scroll_pause, max_scrolls, collect_limit, deadline, collected, seen,
             )
 
-        # Обрезаем до сбора данных, только если не сортируем по дате
-        if not sort_by_date and max_items > 0 and len(collected) > max_items:
-            logging.info("Обрезаю до max_items=%d (до запроса данных)", max_items)
-            collected = collected[:max_items]
+        logging.info("Собрано новых ссылок: %d", len(collected))
 
-        table_data = build_table_data(collected, sort_by_date, max_items)
-        save_table(table_data, output_path)
-        
+        new_items = build_table_data(collected, sort_by_date)
+
+        if sort_by_date:
+            if max_items > 0 and len(new_items) > max_items:
+                logging.info("Обрезаю новые записи до max_items=%d (самые новые из новых)", max_items)
+                new_items = new_items[:max_items]
+            all_pending = existing_pending + new_items
+            all_pending.sort(key=lambda x: x["ts"], reverse=True)
+        else:
+            if max_items > 0 and len(new_items) > max_items:
+                new_items = new_items[:max_items]
+            all_pending = existing_pending + new_items
+
+        save_table(all_pending, existing_sent, output_path)
+
     finally:
         driver.quit()
 
