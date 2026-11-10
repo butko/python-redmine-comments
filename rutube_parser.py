@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
-# Версия: v1.6
+# Версия: v2.0
 """
-Собирает ссылки на видео и Shorts с канала Rutube и сохраняет их в файл.
-Сбор идёт с главной страницы канала (видео и Shorts в общем потоке, новые сверху).
-Дополнительно запрашивает дату публикации через официальный API Rutube и
-сортирует итоговый список по дате (самые новые сверху).
+Собирает ссылки на видео и Shorts с канала Rutube и сохраняет их в файл
+в виде таблицы Textile (формат Redmine).
+Ссылки очищаются от параметров плейлиста (остаётся только базовый URL).
+Дата публикации и заголовок запрашиваются через официальный API Rutube.
 
-Если API недоступен, сохраняется порядок с главной страницы (он также
-соответствует хронологии: новые сверху).
+Логика max_items:
+  - если sort_by_date = true: собираются все ссылки, сортируются по дате,
+    и только потом обрезаются до max_items (чтобы получить самые новые);
+  - если sort_by_date = false: прокрутка останавливается при достижении max_items.
 """
 
 import argparse
@@ -20,6 +22,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from datetime import datetime
 from pathlib import Path
 
 from selenium import webdriver
@@ -149,19 +152,17 @@ def get_channel_slug(driver: webdriver.Chrome, channel_url: str) -> str:
 def collect_from_page(
     driver: webdriver.Chrome,
     url: str,
-    video_pattern: re.Pattern,
-    shorts_pattern: re.Pattern,
+    link_pattern: re.Pattern,
     scroll_pause: int,
     max_scrolls: int,
-    max_items: int,
+    max_items: int,      # 0 = без ограничения при сборе
     collected: list,
     seen: set,
-) -> tuple:
-    """Прокручивает страницу и добавляет найденные ссылки в общий список.
-
-    Возвращает (общее_число_добавленных, сколько_добавлено_видео, сколько_добавлено_shorts).
-    Если max_items > 0 — останавливается, как только в collected набирается
-    max_items элементов.
+) -> int:
+    """Прокручивает страницу и собирает уникальные ссылки.
+    
+    Если max_items > 0, сбор останавливается при достижении этого количества.
+    Если max_items == 0, собираются все ссылки до стабилизации страницы.
     """
     logging.info("Открываю страницу: %s", url)
     try:
@@ -171,10 +172,9 @@ def collect_from_page(
         )
     except (TimeoutException, WebDriverException) as exc:
         logging.error("Не удалось открыть %s: %s", url, exc)
-        return 0, 0, 0
+        return 0
 
-    added_video = 0
-    added_shorts = 0
+    added_count = 0
     last_height = 0
     stable_rounds = 0
 
@@ -183,25 +183,28 @@ def collect_from_page(
         new_this_round = 0
         for a in anchors:
             href = a.get_attribute("href") or ""
-            if href in seen:
+            match = link_pattern.search(href)
+            if not match:
                 continue
-            if video_pattern.search(href):
-                collected.append(href)
-                seen.add(href)
-                added_video += 1
-                new_this_round += 1
-            elif shorts_pattern.search(href):
-                collected.append(href)
-                seen.add(href)
-                added_shorts += 1
-                new_this_round += 1
+                
+            kind = match.group(1)
+            video_id = match.group(2)
+            
+            if video_id in seen:
+                continue
+                
+            seen.add(video_id)
+            clean_url = f"https://rutube.ru/{kind}/{video_id}/"
+            collected.append((video_id, clean_url))
+            added_count += 1
+            new_this_round += 1
 
             if max_items > 0 and len(collected) >= max_items:
                 logging.info(
                     "Достигнут лимит max_items=%d (прокрутка %d). Останавливаюсь.",
                     max_items, i,
                 )
-                return new_this_round, added_video, added_shorts
+                return added_count
 
         driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
         time.sleep(scroll_pause)
@@ -214,8 +217,8 @@ def collect_from_page(
         last_height = new_height
 
         logging.info(
-            "Прокрутка %d: всего %d ссылок (добавлено %d: видео %d, shorts %d), высота %s",
-            i, len(collected), new_this_round, added_video, added_shorts, new_height,
+            "Прокрутка %d: всего %d ссылок (добавлено %d), высота %s",
+            i, len(collected), new_this_round, new_height,
         )
 
         if max_items > 0 and len(collected) >= max_items:
@@ -229,64 +232,111 @@ def collect_from_page(
             logging.info("Высота страницы стабилизировалась — завершаю прокрутку.")
             break
 
-    return len(collected), added_video, added_shorts
+    return added_count
 
 
-def extract_video_id(url: str) -> str:
-    """Извлекает ID видео из URL Rutube (видео или shorts)."""
-    match = re.search(r"rutube\.ru/(?:video|shorts)/([0-9a-f]+)", url)
-    return match.group(1) if match else ""
-
-
-def fetch_publication_ts(video_id: str) -> int:
-    """Запрашивает дату публикации через API Rutube. Возвращает timestamp или 0."""
+def fetch_publication_data(video_id: str) -> tuple:
+    """Запрашивает заголовок и дату публикации через API Rutube.
+    
+    Возвращает (заголовок, timestamp). Если API не отвечает, возвращает ("", 0).
+    """
     if not video_id:
-        return 0
+        return "", 0
     url = API_URL_TEMPLATE.format(video_id=video_id)
-    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Referer": "https://rutube.ru/",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+    }
+    req = urllib.request.Request(url, headers=headers)
+    
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
             data = json.loads(resp.read().decode("utf-8"))
-            ts = data.get("publication_ts") or data.get("created_ts") or 0
-            return int(ts)
-    except (urllib.error.URLError, OSError, ValueError, json.JSONDecodeError):
-        return 0
+            title = str(data.get("title", "")).strip()
+            
+            raw_ts = data.get("publication_ts") or data.get("created_ts") or 0
+            
+            ts = 0
+            if isinstance(raw_ts, (int, float)):
+                ts = int(raw_ts)
+            elif isinstance(raw_ts, str):
+                try:
+                    dt = datetime.fromisoformat(raw_ts.replace('Z', '+00:00'))
+                    ts = int(dt.timestamp())
+                except ValueError:
+                    try:
+                        ts = int(raw_ts)
+                    except ValueError:
+                        logging.warning("Не удалось распознать дату '%s' для видео %s", raw_ts, video_id)
+            
+            return title, ts
+    except urllib.error.HTTPError as e:
+        logging.warning("API HTTP %s для видео %s", e.code, video_id)
+        return "", 0
+    except urllib.error.URLError as e:
+        logging.warning("API URL Error для видео %s: %s", video_id, e.reason)
+        return "", 0
+    except json.JSONDecodeError:
+        logging.warning("API вернул не JSON для видео %s", video_id)
+        return "", 0
+    except Exception as e:
+        logging.warning("API Неизвестная ошибка для видео %s: %s", video_id, e)
+        return "", 0
 
 
-def sort_by_publication_date(links: list) -> list:
-    """Сортирует ссылки по дате публикации (самые новые сверху).
-
-    Для каждой ссылки запрашивает дату через API. Если дату получить не удалось,
-    элемент уходит в конец, сохраняя относительный порядок.
-    """
-    logging.info("Запрашиваю даты публикации для %d ссылок...", len(links))
-    dated = []
-    undated = []
-    for idx, link in enumerate(links, 1):
-        video_id = extract_video_id(link)
-        ts = fetch_publication_ts(video_id)
+def build_table_data(collected: list, sort_by_date: bool, max_items: int) -> list:
+    """Обогащает список ссылок заголовками и датами. Сортирует и обрезает."""
+    logging.info("Запрашиваю данные для %d ссылок...", len(collected))
+    processed = []
+    
+    for idx, (video_id, clean_url) in enumerate(collected, 1):
+        title, ts = fetch_publication_data(video_id)
+        
         if ts > 0:
-            dated.append((ts, link))
+            date_str = datetime.fromtimestamp(ts).strftime('%d.%m.%Y')
         else:
-            undated.append(link)
+            date_str = ""
+            
+        if not title:
+            title = "Без названия"
+            
+        safe_title = title.replace("|", "&#124;").replace("\n", " ").replace("\r", " ")
+        
+        processed.append({
+            "ts": ts,
+            "date_str": date_str,
+            "title": safe_title,
+            "url": clean_url,
+        })
+        
         if idx % 50 == 0:
-            logging.info("  обработано %d/%d", idx, len(links))
-    dated.sort(key=lambda x: x[0], reverse=True)
-    result = [link for _, link in dated] + undated
-    logging.info("Даты получены для %d из %d ссылок.", len(dated), len(links))
-    return result
+            logging.info("  обработано %d/%d", idx, len(collected))
+            
+        time.sleep(0.1)  # Небольшая пауза между запросами
+            
+    if sort_by_date:
+        processed.sort(key=lambda x: x["ts"], reverse=True)
+        
+    # Обрезаем после сортировки, чтобы оставить самые новые
+    if max_items > 0 and len(processed) > max_items:
+        logging.info("Обрезаю до max_items=%d", max_items)
+        processed = processed[:max_items]
+        
+    logging.info("Данные получены для %d ссылок.", len(processed))
+    return processed
 
 
-def save_links(links: list, output_path: Path, as_markdown: bool = True) -> None:
-    """Сохраняет ссылки в файл, по одной на строку, в заданном порядке."""
+def save_table(items: list, output_path: Path) -> None:
+    """Сохраняет таблицу в формате Textile для Redmine."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, "w", encoding="utf-8") as f:
-        for link in links:
-            if as_markdown:
-                f.write(f"* {link}\n")
-            else:
-                f.write(f"{link}\n")
-    logging.info("Сохранено %d ссылок в %s", len(links), output_path)
+        f.write("|_.Дата публикации|_.Заголовок|_.Ссылка|\n")
+        for item in items:
+            f.write(f"|{item['date_str']}|{item['title']}|{item['url']}|\n")
+    logging.info("Сохранено %d строк в %s", len(items), output_path)
 
 
 def main() -> int:
@@ -308,7 +358,7 @@ def main() -> int:
             logging.FileHandler(script_log, mode="w", encoding="utf-8"),
         ],
     )
-    logging.info("=== Запуск rutube_parser (v1.6) ===")
+    logging.info("=== Запуск rutube_parser (v2.0) ===")
     logging.info("Конфиг: %s", config_path)
 
     config = load_config(str(config_path))
@@ -335,7 +385,10 @@ def main() -> int:
     sort_by_date = config.getboolean("rutube", "sort_by_date", fallback=DEFAULT_SORT_BY_DATE)
 
     if max_items > 0:
-        logging.info("Ограничение max_items: %d (общий лимит, видео + Shorts)", max_items)
+        if sort_by_date:
+            logging.info("Ограничение max_items: %d (будет применено ПОСЛЕ сортировки по дате)", max_items)
+        else:
+            logging.info("Ограничение max_items: %d (остановка при сборе)", max_items)
     else:
         logging.info("Ограничение max_items: не задано (собираем все)")
 
@@ -348,8 +401,7 @@ def main() -> int:
     try:
         identifier = get_channel_slug(driver, channel_url)
 
-        video_pattern = re.compile(r"rutube\.ru/video/[0-9a-f]+")
-        shorts_pattern = re.compile(r"rutube\.ru/shorts/[0-9a-f]+")
+        link_pattern = re.compile(r"rutube\.ru/(video|shorts)/([0-9a-f]+)")
 
         main_url = (
             f"https://rutube.ru/channel/{identifier}/" if identifier.isdigit()
@@ -359,52 +411,35 @@ def main() -> int:
         collected = []
         seen = set()
 
-        logging.info("Шаг 1: собираю с главной страницы канала (%s)", main_url)
-        _, added_video, added_shorts = collect_from_page(
-            driver, main_url, video_pattern, shorts_pattern,
-            scroll_pause, max_scrolls, max_items, collected, seen,
-        )
-        logging.info(
-            "После главной страницы: всего %d (видео %d, shorts %d)",
-            len(collected), added_video, added_shorts,
-        )
+        # Если сортируем по дате, не ограничиваем сбор (max_items=0),
+        # чтобы не потерять новые видео. Ограничение применим позже.
+        collect_limit = 0 if sort_by_date else max_items
 
-        if added_video == 0 and (max_items == 0 or len(collected) < max_items):
+        logging.info("Шаг 1: собираю с главной страницы канала (%s)", main_url)
+        collect_from_page(
+            driver, main_url, link_pattern,
+            scroll_pause, max_scrolls, collect_limit, collected, seen,
+        )
+        
+        if not collected and (collect_limit == 0 or len(collected) < collect_limit):
             videos_url = (
                 f"https://rutube.ru/channel/{identifier}/videos/" if identifier.isdigit()
                 else f"https://rutube.ru/u/{identifier}/videos/"
             )
-            logging.info("Видео на главной не найдены — собираю с %s", videos_url)
-            _, v_added, _ = collect_from_page(
-                driver, videos_url, video_pattern, shorts_pattern,
-                scroll_pause, max_scrolls, max_items, collected, seen,
+            logging.info("На главной ничего не найдено — собираю с %s", videos_url)
+            collect_from_page(
+                driver, videos_url, link_pattern,
+                scroll_pause, max_scrolls, collect_limit, collected, seen,
             )
-            added_video += v_added
 
-        if added_shorts == 0 and (max_items == 0 or len(collected) < max_items):
-            shorts_url = (
-                f"https://rutube.ru/channel/{identifier}/shorts/" if identifier.isdigit()
-                else f"https://rutube.ru/u/{identifier}/shorts/"
-            )
-            logging.info("Shorts на главной не найдены — собираю с %s", shorts_url)
-            _, _, s_added = collect_from_page(
-                driver, shorts_url, video_pattern, shorts_pattern,
-                scroll_pause, max_scrolls, max_items, collected, seen,
-            )
-            added_shorts += s_added
-
-        if max_items > 0 and len(collected) > max_items:
-            logging.info("Обрезаю до max_items=%d", max_items)
+        # Обрезаем до сбора данных, только если не сортируем по дате
+        if not sort_by_date and max_items > 0 and len(collected) > max_items:
+            logging.info("Обрезаю до max_items=%d (до запроса данных)", max_items)
             collected = collected[:max_items]
 
-        if sort_by_date and collected:
-            collected = sort_by_publication_date(collected)
-
-        save_links(collected, output_path, as_markdown=True)
-        logging.info(
-            "Итого сохранено %d ссылок (видео %d, shorts %d)",
-            len(collected), added_video, added_shorts,
-        )
+        table_data = build_table_data(collected, sort_by_date, max_items)
+        save_table(table_data, output_path)
+        
     finally:
         driver.quit()
 
