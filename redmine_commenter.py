@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Версия: v2.5
+# Версия: v2.6
 """
 Добавляет комментарии к нескольким задачам Redmine через браузер.
 Задачи задаются секциями [task:<метка>]. Для каждой задачи текст
@@ -160,18 +160,10 @@ def parse_tasks(config: configparser.ConfigParser) -> list:
     """Собирает задачи из [task:*]. Валидирует URL, файлы и prepare."""
     task_sections = [s for s in config.sections() if s.startswith(TASK_SECTION_PREFIX)]
     if not task_sections:
-        legacy_url = config.get("redmine", "issue_url", fallback="").strip()
-        if legacy_url:
-            logging.error(
-                "В конфиге нет секций [task:*], но найдена устаревшая [redmine] issue_url. "
-                "Начиная с v2.0 задачи задаются секциями вида [task:<метка>]. "
-                "Перенесите issue_url и comment_file в секцию [task:...]."
-            )
-        else:
-            logging.error(
-                "В конфиге нет ни одной секции [task:<метка>]. "
-                "Добавьте хотя бы одну. Подробнее — раздел «Настройка задач» в readme.md."
-            )
+        logging.error(
+            "В конфиге нет ни одной секции [task:<метка>]. "
+            "Добавьте хотя бы одну. Подробнее — раздел «Настройка задач» в readme.md."
+        )
         sys.exit(1)
 
     tasks = []
@@ -871,7 +863,7 @@ def main() -> int:
             logging.FileHandler(script_log, mode="w", encoding="utf-8"),
         ],
     )
-    logging.info("=== Запуск redmine_commenter (v2.5), args=%s ===", vars(args))
+    logging.info("=== Запуск redmine_commenter (v2.6), args=%s ===", vars(args))
 
     config_path = Path(args.config)
     if not config_path.is_absolute():

@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!-- Версия: v1.5 -->
+<!-- Версия: v1.6 -->
 <svg xmlns="http://www.w3.org/2000/svg" width="960" height="1020" viewBox="0 0 960 1020">
   <defs>
     <style>
@@ -94,7 +94,7 @@
   <text x="60" y="790" class="label">Открыть issue_url</text>
 
   <rect x="40" y="840" width="520" height="50" class="box" />
-  <text x="60" y="870" class="label">Показать #update, ввести текст, «Отправить»</text>
+  <text x="60" y="870" class="label">Показать #update, ввести текст (по частям), «Отправить»</text>
 
   <rect x="40" y="920" width="520" height="50" class="box" />
   <text x="60" y="950" class="label">Проверить появление текста в #history</text>
